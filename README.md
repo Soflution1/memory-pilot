@@ -1,6 +1,20 @@
-# MemoryPilot
+<p align="center">
+  <img src="static/banner.svg" alt="MemoryPilot" width="900"/>
+</p>
 
-High-performance MCP memory server in Rust. Single binary, zero dependencies.
+<p align="center">
+  <strong>High-performance MCP memory server for AI agents.</strong><br>
+  <sub>Persistent searchable memory · Project-aware · Single binary · Zero dependencies</sub>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
+  <img src="https://img.shields.io/badge/search-SQLite_FTS5-blueviolet" alt="SQLite FTS5"/>
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"/>
+  <img src="https://img.shields.io/badge/binary-~2.2MB-yellow" alt="Binary size"/>
+</p>
+
+---
 
 ## Why
 

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="static/banner.svg" alt="MemoryPilot" width="900"/>
+  <img src="static/banner.png" alt="MemoryPilot" width="900"/>
 </p>
 
 <p align="center">

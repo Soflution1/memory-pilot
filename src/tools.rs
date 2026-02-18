@@ -11,6 +11,18 @@ const VALID_KINDS: &[&str] = &[
 pub fn tool_definitions() -> Value {
     json!({ "tools": [
         {
+            "name": "recall",
+            "description": "⚡ START HERE — Call this at the beginning of EVERY new conversation. Loads all relevant context in one shot: project memories, global preferences, critical facts, patterns, decisions, and GLOBAL_PROMPT. Optionally pass hints about the current task for targeted search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"], "description": "Project name (or null for auto-detect)" },
+                    "working_dir": { "type": ["string","null"], "description": "Current working directory for project auto-detection" },
+                    "hints": { "type": ["string","null"], "description": "Keywords about current task for targeted memory search" }
+                }
+            }
+        },
+        {
             "name": "add_memory",
             "description": "Store a new memory with dedup. If near-duplicate exists, merges instead of creating. Kinds: fact, preference, decision, pattern, snippet, bug, credential, todo, note.",
             "inputSchema": {
@@ -158,6 +170,7 @@ pub fn tool_definitions() -> Value {
 /// Handle a tools/call request.
 pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
     match name {
+        "recall" => handle_recall(db, args),
         "add_memory" => handle_add(db, args),
         "add_memories" => handle_add_bulk(db, args),
         "search_memory" => handle_search(db, args),
@@ -175,6 +188,16 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "migrate_v1" => handle_migrate(db),
         "cleanup_expired" => handle_cleanup(db),
         _ => tool_error(&format!("Unknown tool: {}", name)),
+    }
+}
+
+fn handle_recall(db: &Database, args: &Value) -> Value {
+    let project = args.get("project").and_then(|v| v.as_str());
+    let working_dir = args.get("working_dir").and_then(|v| v.as_str());
+    let hints = args.get("hints").and_then(|v| v.as_str());
+    match db.recall(project, working_dir, hints) {
+        Ok(ctx) => tool_result(&serde_json::to_string_pretty(&ctx).unwrap()),
+        Err(e) => tool_error(&e),
     }
 }
 

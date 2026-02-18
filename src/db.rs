@@ -590,6 +590,76 @@ impl Database {
             }
         }))
     }
+    // ─── RECALL (auto-context loader) ─────────────────
+
+    /// One-shot context loader for new conversations.
+    /// Combines: project context, global prompt, critical memories, and optional hint search.
+    pub fn recall(&self, project: Option<&str>, working_dir: Option<&str>, hints: Option<&str>) -> Result<serde_json::Value, String> {
+        // Auto-detect project
+        let proj_name = match project {
+            Some(p) => Some(p.to_string()),
+            None => match working_dir { Some(wd) => self.detect_project(wd)?, None => None }
+        };
+        let proj_ref = proj_name.as_deref();
+
+        // 1. Project memories (if project detected)
+        let (proj_memories, proj_total) = if let Some(p) = proj_ref {
+            self.list_memories(Some(p), None, 50, 0)?
+        } else { (vec![], 0) };
+
+        // 2. Global preferences + patterns (always useful)
+        let (prefs, _) = self.list_memories(None, Some("preference"), 30, 0)?;
+        let (patterns, _) = self.list_memories(None, Some("pattern"), 20, 0)?;
+        let (decisions, _) = self.list_memories(None, Some("decision"), 20, 0)?;
+
+        // 3. Critical memories (importance >= 4, any project)
+        let critical: Vec<Memory> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at \
+                 FROM memories WHERE importance >= 4 \
+                 AND (expires_at IS NULL OR expires_at > datetime('now')) \
+                 ORDER BY importance DESC, updated_at DESC LIMIT 30"
+            ).map_err(|e| format!("Recall critical: {}", e))?;
+            let rows = stmt.query_map([], |r| Ok(row_to_memory(r)))
+                .map_err(|e| format!("Recall critical: {}", e))?;
+            rows.flatten().collect()
+        };
+
+        // 4. Hint-based search (if user/agent gives context about current task)
+        let hint_results = if let Some(h) = hints {
+            if !h.trim().is_empty() {
+                self.search(h, 10, proj_ref, None, None).unwrap_or_default()
+            } else { vec![] }
+        } else { vec![] };
+
+        // 5. Global prompt
+        let global_prompt = self.get_global_prompt(proj_ref, working_dir);
+
+        // 6. Stats summary
+        let total: i64 = self.conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0)).unwrap_or(0);
+        let projects_count: i64 = self.conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap_or(0);
+
+        Ok(serde_json::json!({
+            "status": "recalled",
+            "project": proj_ref.unwrap_or("none"),
+            "stats": { "total_memories": total, "projects": projects_count, "project_memories": proj_total },
+            "critical_memories": critical.iter().map(|m| serde_json::json!({
+                "content": m.content, "kind": m.kind, "project": m.project,
+                "tags": m.tags, "importance": m.importance
+            })).collect::<Vec<_>>(),
+            "project_context": proj_memories.iter().map(|m| serde_json::json!({
+                "content": m.content, "kind": m.kind, "tags": m.tags, "importance": m.importance
+            })).collect::<Vec<_>>(),
+            "preferences": prefs.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            "patterns": patterns.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            "decisions": decisions.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            "hint_results": hint_results.iter().map(|r| serde_json::json!({
+                "content": r.memory.content, "score": r.score, "project": r.memory.project
+            })).collect::<Vec<_>>(),
+            "global_prompt": global_prompt.as_deref().unwrap_or(""),
+        }))
+    }
+
     // ─── IMPORT / MIGRATE ─────────────────────────────
 
     pub fn import_batch(&self, memories: &[(String, String, Option<String>, Vec<String>, String)]) -> Result<usize, String> {

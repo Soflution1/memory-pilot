@@ -47,7 +47,8 @@ fn handle_request(db: &db::Database, req: &JsonRpcRequest) -> JsonRpcResponse {
         "initialize" => JsonRpcResponse::success(req.id.clone(), json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": SERVER_NAME, "version": VERSION }
+            "serverInfo": { "name": SERVER_NAME, "version": VERSION },
+            "instructions": "IMPORTANT: At the start of every new conversation, call the 'recall' tool to load persistent memory context (project memories, preferences, critical facts, decisions). Pass working_dir for auto-detection. This ensures continuity across sessions."
         })),
         "notifications/initialized" => JsonRpcResponse::success(req.id.clone(), json!({})),
         "tools/list" => JsonRpcResponse::success(req.id.clone(), tools::tool_definitions()),

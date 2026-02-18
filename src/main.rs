@@ -95,7 +95,7 @@ fn print_help() {
     println!("  cleanup_expired     Remove expired memories");
     println!("  migrate_v1          Import from v1 JSON files");
     println!();
-    println!("STORAGE:  ~/.memory-pilot/memory.db");
+    println!("STORAGE:  ~/.MemoryPilot/memory.db");
     println!("SEARCH:   SQLite FTS5 with BM25 × importance");
     println!("BUILT BY: SOFLUTION LTD");
 }

@@ -126,7 +126,7 @@ pub fn tool_definitions() -> Value {
         { "name": "get_stats", "description": "Database statistics: totals, by kind, by project, expired count, db size.", "inputSchema": { "type": "object", "properties": {} } },
         {
             "name": "get_global_prompt",
-            "description": "Load GLOBAL_PROMPT.md. Auto-scans: 1) configured path, 2) ~/.memory-pilot/GLOBAL_PROMPT.md, 3) project root GLOBAL_PROMPT.md.",
+            "description": "Load GLOBAL_PROMPT.md. Auto-scans: 1) configured path, 2) ~/.MemoryPilot/GLOBAL_PROMPT.md, 3) project root GLOBAL_PROMPT.md.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -322,7 +322,7 @@ fn handle_global_prompt(db: &Database, args: &Value) -> Value {
     let working_dir = args.get("working_dir").and_then(|v| v.as_str());
     match db.get_global_prompt(project, working_dir) {
         Some(prompt) => tool_result(&prompt),
-        None => tool_error("No GLOBAL_PROMPT.md found. Place it in ~/.memory-pilot/ or project root, or use set_config(key='global_prompt_path')."),
+        None => tool_error("No GLOBAL_PROMPT.md found. Place it in ~/.MemoryPilot/ or project root, or use set_config(key='global_prompt_path')."),
     }
 }
 

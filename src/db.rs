@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use chrono::Utc;
 
-const DB_DIR: &str = ".memory-pilot";
+const DB_DIR: &str = ".MemoryPilot";
 const DB_FILE: &str = "memory.db";
 const PROMPT_FILE: &str = "GLOBAL_PROMPT.md";
 const DEDUP_THRESHOLD: f64 = 0.85;
@@ -535,7 +535,7 @@ impl Database {
             if let Ok(content) = std::fs::read_to_string(&path) { prompts.push(content); }
         }
 
-        // 2. Auto-scan ~/.memory-pilot/GLOBAL_PROMPT.md
+        // 2. Auto-scan ~/.MemoryPilot/GLOBAL_PROMPT.md
         let home_prompt = dirs::home_dir().map(|h| h.join(DB_DIR).join(PROMPT_FILE));
         if let Some(path) = &home_prompt {
             if path.exists() {

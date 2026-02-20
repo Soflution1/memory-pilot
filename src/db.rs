@@ -26,6 +26,9 @@ pub struct Memory {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    pub access_count: i32,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
@@ -65,6 +68,7 @@ impl Database {
         let db = Self { conn };
         db.init_schema()?;
         db.upgrade_schema()?;
+        let _ = db.backfill_embeddings();
         Ok(db)
     }
     fn init_schema(&self) -> Result<(), String> {
@@ -79,9 +83,32 @@ impl Database {
                 importance INTEGER NOT NULL DEFAULT 3,
                 expires_at TEXT,
                 metadata TEXT,
+                embedding BLOB,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                last_accessed_at TEXT,
+                access_count INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS memory_links (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL DEFAULT 'relates_to',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, target_id),
+                FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_links_source ON memory_links(source_id);
+            CREATE INDEX IF NOT EXISTS idx_links_target ON memory_links(target_id);
+
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_value TEXT NOT NULL,
+                FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_value ON memory_entities(entity_value);
+            CREATE INDEX IF NOT EXISTS idx_entities_memory ON memory_entities(memory_id);
             CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
             CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
             CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
@@ -117,6 +144,37 @@ impl Database {
                  ALTER TABLE memories ADD COLUMN expires_at TEXT;"
             );
         }
+        // v3.0 columns
+        let has_embedding: bool = self.conn
+            .prepare("SELECT embedding FROM memories LIMIT 0")
+            .is_ok();
+        if !has_embedding {
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE memories ADD COLUMN embedding BLOB;
+                 ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
+                 ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE IF NOT EXISTS memory_links (
+                     source_id TEXT NOT NULL,
+                     target_id TEXT NOT NULL,
+                     relation_type TEXT NOT NULL DEFAULT 'relates_to',
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                     PRIMARY KEY (source_id, target_id),
+                     FOREIGN KEY (source_id) REFERENCES memories(id) ON DELETE CASCADE,
+                     FOREIGN KEY (target_id) REFERENCES memories(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_links_source ON memory_links(source_id);
+                 CREATE INDEX IF NOT EXISTS idx_links_target ON memory_links(target_id);
+
+                 CREATE TABLE IF NOT EXISTS memory_entities (
+                     memory_id TEXT NOT NULL,
+                     entity_kind TEXT NOT NULL,
+                     entity_value TEXT NOT NULL,
+                     FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_entities_value ON memory_entities(entity_value);
+                 CREATE INDEX IF NOT EXISTS idx_entities_memory ON memory_entities(memory_id);"
+            );
+        }
         Ok(())
     }
 
@@ -147,7 +205,7 @@ impl Database {
         let norm = Self::normalize(content);
         let memories: Vec<Memory> = if let Some(p) = project {
             let mut stmt = self.conn.prepare(
-                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at FROM memories WHERE project=?1 ORDER BY updated_at DESC LIMIT 200"
+                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories WHERE project=?1 ORDER BY updated_at DESC LIMIT 200"
             ).map_err(|e| format!("Dedup: {}", e))?;
             let rows = stmt.query_map(params![p], |r| Ok(row_to_memory(r)))
                 .map_err(|e| format!("Dedup: {}", e))?;
@@ -155,7 +213,7 @@ impl Database {
             collected
         } else {
             let mut stmt = self.conn.prepare(
-                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at FROM memories WHERE project IS NULL ORDER BY updated_at DESC LIMIT 200"
+                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories WHERE project IS NULL ORDER BY updated_at DESC LIMIT 200"
             ).map_err(|e| format!("Dedup: {}", e))?;
             let rows = stmt.query_map([], |r| Ok(row_to_memory(r)))
                 .map_err(|e| format!("Dedup: {}", e))?;
@@ -170,6 +228,47 @@ impl Database {
         }
         Ok(None)
     }
+    // ─── KNOWLEDGE GRAPH ──────────────────────────────
+    
+    pub fn rebuild_links(&self, memory: &Memory) -> Result<(), String> {
+        let entities = crate::graph::extract_entities(&memory.content, memory.project.as_deref());
+        
+        // 1. Update entities table
+        let _ = self.conn.execute("DELETE FROM memory_entities WHERE memory_id = ?1", params![memory.id]);
+        for entity in &entities {
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity_kind, entity_value) VALUES (?1, ?2, ?3)",
+                params![memory.id, entity.kind, entity.value],
+            );
+        }
+        
+        // 2. Find related memories via shared entities
+        let mut target_ids = std::collections::HashSet::new();
+        for entity in &entities {
+            if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT m.id, m.kind FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE e.entity_value = ?1 AND e.memory_id != ?2 LIMIT 10") {
+                if let Ok(rows) = stmt.query_map(params![entity.value, memory.id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?))) {
+                    for r in rows.flatten() { target_ids.insert((r.0, r.1)); }
+                }
+            }
+        }
+        
+        let _ = self.conn.execute("DELETE FROM memory_links WHERE source_id = ?1 OR target_id = ?1", params![memory.id]);
+        
+        for (target_id, target_kind) in target_ids {
+            let rel = crate::graph::infer_relation(&memory.kind, &target_kind);
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation_type) VALUES (?1, ?2, ?3)",
+                params![memory.id, target_id, rel]
+            );
+            let rev_rel = crate::graph::infer_relation(&target_kind, &memory.kind);
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_links (source_id, target_id, relation_type) VALUES (?1, ?2, ?3)",
+                params![target_id, memory.id, rev_rel]
+            );
+        }
+        Ok(())
+    }
+
     // ─── CRUD ────────────────────────────────────────
 
     /// Add memory with dedup check. Returns (memory, was_merged).
@@ -194,11 +293,13 @@ impl Database {
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
         let meta_json = metadata.map(|m| serde_json::to_string(m).unwrap_or_default());
         let imp = importance.clamp(1, 5);
+        let emb = crate::embedding::embed_text(content);
+        let emb_blob = crate::embedding::vec_to_blob(&emb);
 
         self.conn.execute(
-            "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![id, content, kind, project, tags_json, source, imp, expires_at, meta_json, now, now],
+            "INSERT INTO memories (id,content,kind,project,tags,source,importance,expires_at,metadata,embedding,created_at,updated_at,access_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0)",
+            params![id, content, kind, project, tags_json, source, imp, expires_at, meta_json, emb_blob, now, now],
         ).map_err(|e| format!("Insert: {}", e))?;
 
         // FTS index
@@ -210,9 +311,11 @@ impl Database {
 
         if let Some(proj) = project { let _ = self.ensure_project(proj); }
 
-        Ok((Memory { id, content: content.into(), kind: kind.into(), project: project.map(String::from),
+        let mem = Memory { id, content: content.into(), kind: kind.into(), project: project.map(String::from),
             tags: tags.to_vec(), source: source.into(), importance: imp, expires_at: expires_at.map(String::from),
-            created_at: now.clone(), updated_at: now, metadata: metadata.cloned() }, false))
+            created_at: now.clone(), updated_at: now, metadata: metadata.cloned(), last_accessed_at: None, access_count: 0 };
+        let _ = self.rebuild_links(&mem);
+        Ok((mem, false))
     }
     /// Full update with all fields.
     pub fn update_memory_full(&self, id: &str, content: Option<&str>, kind: Option<&str>,
@@ -226,10 +329,12 @@ impl Database {
         let tags_json = serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".into());
         let new_imp = importance.unwrap_or(existing.importance).clamp(1, 5);
         let new_exp = if expires_at.is_some() { expires_at.map(String::from) } else { existing.expires_at.clone() };
+        let emb = crate::embedding::embed_text(new_content);
+        let emb_blob = crate::embedding::vec_to_blob(&emb);
 
         self.conn.execute(
-            "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,updated_at=?6 WHERE id=?7",
-            params![new_content, new_kind, tags_json, new_imp, new_exp, now, id],
+            "UPDATE memories SET content=?1,kind=?2,tags=?3,importance=?4,expires_at=?5,updated_at=?6,embedding=?7 WHERE id=?8",
+            params![new_content, new_kind, tags_json, new_imp, new_exp, now, emb_blob, id],
         ).map_err(|e| format!("Update: {}", e))?;
 
         // Rebuild FTS
@@ -242,10 +347,13 @@ impl Database {
                 params![rowid, new_content, tags_json, new_kind, proj]);
         }
 
-        Ok(Some(Memory { id: id.into(), content: new_content.into(), kind: new_kind.into(),
+        let mem = Memory { id: id.into(), content: new_content.into(), kind: new_kind.into(),
             project: existing.project, tags: new_tags, source: existing.source,
             importance: new_imp, expires_at: new_exp,
-            created_at: existing.created_at, updated_at: now, metadata: existing.metadata }))
+            created_at: existing.created_at, updated_at: now, metadata: existing.metadata, 
+            last_accessed_at: existing.last_accessed_at, access_count: existing.access_count };
+        let _ = self.rebuild_links(&mem);
+        Ok(Some(mem))
     }
 
 
@@ -262,7 +370,7 @@ impl Database {
 
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>, String> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at FROM memories WHERE id=?1"
+            "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories WHERE id=?1"
         ).map_err(|e| format!("Prepare: {}", e))?;
         let mut rows = stmt.query(params![id]).map_err(|e| format!("Query: {}", e))?;
         match rows.next().map_err(|e| format!("Next: {}", e))? {
@@ -296,7 +404,7 @@ impl Database {
     // ─── SEARCH (FTS5 BM25 × importance) ──────────────
 
     pub fn search(&self, query: &str, limit: usize, project: Option<&str>,
-                  kind: Option<&str>, tags: Option<&[String]>) -> Result<Vec<SearchResult>, String> {
+                  kind: Option<&str>, tags: Option<&[String]>, watcher_keywords: Option<&[String]>) -> Result<Vec<SearchResult>, String> {
         let fts_terms: String = query.split_whitespace()
             .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
             .collect::<Vec<_>>()
@@ -306,7 +414,9 @@ impl Database {
         // Clean expired before search
         let _ = self.cleanup_expired();
 
-        // Build query with optional filters
+        let query_emb = crate::embedding::embed_text(query);
+
+        // 1. BM25 Search
         let mut conditions = vec!["memories_fts MATCH ?1".to_string()];
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(fts_terms.clone())];
 
@@ -320,37 +430,147 @@ impl Database {
         }
 
         let where_clause = conditions.join(" AND ");
-        // Score = BM25 (negative, lower=better) adjusted by importance
         let sql = format!(
-            "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,
+            "SELECT m.id,m.content,m.kind,m.project,m.tags,m.source,m.importance,m.expires_at,m.metadata,m.created_at,m.updated_at,m.last_accessed_at,m.access_count,
                     bm25(memories_fts, 10.0, 3.0, 1.0, 2.0) AS bm25_score
              FROM memories_fts f
              JOIN memories m ON m.rowid = f.rowid
              WHERE {}
-             ORDER BY (bm25_score / m.importance) ASC
-             LIMIT ?{}", where_clause, param_values.len() + 1);
-        param_values.push(Box::new(limit as i64));
+             ORDER BY bm25_score ASC
+             LIMIT 100", where_clause);
+             
         let mut stmt = self.conn.prepare(&sql).map_err(|e| format!("Search prepare: {}", e))?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let mut bm25_results = std::collections::HashMap::new();
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             let mem = row_to_memory(row);
-            let bm25: f64 = row.get(11)?;
+            let bm25: f64 = row.get(13)?;
             Ok((mem, bm25))
         }).map_err(|e| format!("Search: {}", e))?;
+        
+        let mut rank = 1;
+        let mut all_memories = std::collections::HashMap::new();
+        for r in rows.flatten() {
+            let (mem, _) = r;
+            bm25_results.insert(mem.id.clone(), rank);
+            all_memories.insert(mem.id.clone(), mem);
+            rank += 1;
+        }
+
+        // 2. Vector Search (Fetch embeddings matching filters)
+        let mut vec_conditions = Vec::new();
+        let mut vec_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(p) = project {
+            vec_conditions.push(format!("project = ?{}", vec_params.len() + 1));
+            vec_params.push(Box::new(p.to_string()));
+        }
+        if let Some(k) = kind {
+            vec_conditions.push(format!("kind = ?{}", vec_params.len() + 1));
+            vec_params.push(Box::new(k.to_string()));
+        }
+        let vec_where = if vec_conditions.is_empty() { String::new() } else { format!("WHERE {}", vec_conditions.join(" AND ")) };
+        let vec_sql = format!("SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count,embedding FROM memories {}", vec_where);
+        let mut stmt2 = self.conn.prepare(&vec_sql).map_err(|e| format!("Vector Search: {}", e))?;
+        let vec_refs: Vec<&dyn rusqlite::types::ToSql> = vec_params.iter().map(|p| p.as_ref()).collect();
+        
+        let mut vector_scores: Vec<(String, f32)> = Vec::new();
+        let rows2 = stmt2.query_map(vec_refs.as_slice(), |row| {
+            let mem = row_to_memory(row);
+            let blob: Option<Vec<u8>> = row.get(13)?;
+            Ok((mem, blob))
+        }).map_err(|e| format!("Vector Search error: {}", e))?;
+        
+        for r in rows2.flatten() {
+            let (mem, blob) = r;
+            all_memories.entry(mem.id.clone()).or_insert_with(|| mem.clone());
+            if let Some(b) = blob {
+                let emb = crate::embedding::blob_to_vec(&b);
+                let score = crate::embedding::cosine_similarity(&query_emb, &emb);
+                vector_scores.push((mem.id, score));
+            } else {
+                vector_scores.push((mem.id, 0.0));
+            }
+        }
+        
+        // Sort vector scores descending
+        vector_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut vector_results = std::collections::HashMap::new();
+        for (i, (id, _)) in vector_scores.iter().take(100).enumerate() {
+            vector_results.insert(id.clone(), i + 1);
+        }
+
+        // 3. RRF Fusion
+        let mut rrf_scores: Vec<(String, f64)> = Vec::new();
+        
+        // Fetch graph links for PageRank-like boost
+        let mut link_boosts: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT target_id, relation_type FROM memory_links") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))) {
+                for r in rows.flatten() {
+                    let (target, relation) = r;
+                    let boost = match relation.as_str() {
+                        "deprecates" => -0.9, // heavy penalty
+                        "depends_on" | "implements" | "resolves" => 0.1, // incoming link boost
+                        _ => 0.05,
+                    };
+                    *link_boosts.entry(target).or_default() += boost;
+                }
+            }
+        }
+        
+        for (id, mem) in &all_memories {
+            let bm25_rank = bm25_results.get(id).copied().unwrap_or(1000);
+            let vec_rank = vector_results.get(id).copied().unwrap_or(1000);
+            let mut score = crate::embedding::rrf_score(bm25_rank, vec_rank);
+            
+            // Boost score by importance (1.0 to 5.0 factor approx)
+            score = score * (mem.importance as f64 / 3.0); 
+            
+            // PageRank-like link boost
+            if let Some(lb) = link_boosts.get(id) {
+                if *lb < 0.0 {
+                    score *= 1.0 + lb; // penalty (e.g. 1.0 - 0.9 = 0.1x score)
+                } else {
+                    score *= 1.0 + lb; // boost
+                }
+            }
+            
+            // Watcher boost (dynamic context)
+            if let Some(keywords) = watcher_keywords {
+                let content_lower = mem.content.to_lowercase();
+                let match_count = keywords.iter().filter(|w| content_lower.contains(w.to_lowercase().as_str())).count();
+                if match_count > 0 {
+                    score *= 1.0 + (match_count as f64 * 0.2); // +20% per matching keyword
+                }
+            }
+            
+            // Also boost if tag match
+            if let Some(filter_tags) = tags {
+                let filter_set: std::collections::HashSet<String> = filter_tags.iter().map(|t| t.to_lowercase()).collect();
+                if mem.tags.iter().any(|t| filter_set.contains(&t.to_lowercase())) {
+                    score *= 1.5;
+                } else {
+                    score *= 0.1; // penalize if tags are requested but don't match
+                }
+            }
+            rrf_scores.push((id.clone(), score));
+        }
+
+        rrf_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut results: Vec<SearchResult> = Vec::new();
-        for r in rows.flatten() {
-            let (mem, bm25) = r;
-            let score = (-bm25 * mem.importance as f64).max(0.0);
-            let score = (score * 100.0).round() / 100.0;
-            results.push(SearchResult { memory: mem, score });
+        for (id, score) in rrf_scores.into_iter().take(limit) {
+            if let Some(mem) = all_memories.remove(&id) {
+                results.push(SearchResult { memory: mem, score: (score * 10000.0).round() / 10000.0 });
+            }
+        }
+        
+        // Update access count and timestamp for returned results
+        for res in &results {
+            let _ = self.conn.execute("UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2", 
+                params![chrono::Utc::now().to_rfc3339(), res.memory.id]);
         }
 
-        // Post-filter by tags if requested
-        if let Some(filter_tags) = tags {
-            let filter_set: std::collections::HashSet<String> = filter_tags.iter().map(|t| t.to_lowercase()).collect();
-            results.retain(|r| r.memory.tags.iter().any(|t| filter_set.contains(&t.to_lowercase())));
-        }
         Ok(results)
     }
     // ─── LIST ─────────────────────────────────────────
@@ -380,7 +600,7 @@ impl Database {
             .map_err(|e| format!("Count: {}", e))?;
 
         let data_sql = format!(
-            "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at FROM memories{} ORDER BY updated_at DESC LIMIT ?{} OFFSET ?{}",
+            "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count FROM memories{} ORDER BY updated_at DESC LIMIT ?{} OFFSET ?{}",
             where_clause, param_values.len() + 1, param_values.len() + 2);
         param_values.push(Box::new(limit as i64));
         param_values.push(Box::new(offset as i64));
@@ -405,6 +625,92 @@ impl Database {
             "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1", params![now]
         ).map_err(|e| format!("Cleanup: {}", e))?;
         Ok(affected)
+    }
+
+    // ─── GC & COMPRESSION ─────────────────────────────
+    
+    pub fn run_gc(&self, config: &crate::gc::GcConfig, dry_run: bool) -> Result<crate::gc::GcReport, String> {
+        let db_path = dirs::home_dir().unwrap_or_default().join(DB_DIR).join(DB_FILE);
+        let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        
+        let mut expired_removed = 0;
+        if !dry_run {
+            expired_removed = self.cleanup_expired()?;
+        }
+        
+        // Find mergeable candidates
+        let now = chrono::Utc::now();
+        let mut groups_merged = 0;
+        let mut memories_compressed = 0;
+        
+        for kind in &config.compressible_kinds {
+            let sql = format!(
+                "SELECT id, content, project, importance, updated_at FROM memories WHERE kind = ?1"
+            );
+            if let Ok(mut stmt) = self.conn.prepare(&sql) {
+                if let Ok(rows) = stmt.query_map(params![kind], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i32>(3)?, r.get::<_, String>(4)?))
+                }) {
+                    let mut by_project: std::collections::HashMap<Option<String>, Vec<(String, String)>> = std::collections::HashMap::new();
+                    for row in rows.flatten() {
+                        let updated_at = chrono::DateTime::parse_from_rfc3339(&row.4).unwrap_or_else(|_| chrono::Utc::now().into());
+                        let age_days = (now - updated_at.with_timezone(&chrono::Utc)).num_days();
+                        
+                        let score = crate::gc::gc_score(row.3, age_days, kind, config);
+                        if score > 0.6 && row.3 < config.importance_threshold && age_days >= config.age_days {
+                            by_project.entry(row.2).or_default().push((row.0, row.1));
+                        }
+                    }
+                    
+                    for (proj, mut items) in by_project {
+                        if items.len() > 1 {
+                            items.truncate(config.max_merge_group);
+                            let contents: Vec<String> = items.iter().map(|i| i.1.clone()).collect();
+                            let merged_content = crate::gc::merge_memories(&contents, kind, proj.as_deref());
+                            
+                            let ids_to_delete: Vec<String> = items.iter().map(|i| i.0.clone()).collect();
+                            
+                            if !dry_run {
+                                if self.add_memory(&merged_content, kind, proj.as_deref(), &["merged".to_string()], "gc_compressor", 3, None, None).is_ok() {
+                                    for id in ids_to_delete {
+                                        let _ = self.delete_memory(&id);
+                                        memories_compressed += 1;
+                                    }
+                                    groups_merged += 1;
+                                }
+                            } else {
+                                memories_compressed += ids_to_delete.len();
+                                groups_merged += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        let mut orphan_links_removed = 0;
+        if !dry_run {
+            orphan_links_removed += self.conn.execute(
+                "DELETE FROM memory_entities WHERE memory_id NOT IN (SELECT id FROM memories)",
+                []
+            ).unwrap_or(0);
+            
+            orphan_links_removed += self.conn.execute(
+                "DELETE FROM memory_links WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)",
+                []
+            ).unwrap_or(0);
+        }
+        
+        let size_after = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        
+        Ok(crate::gc::GcReport {
+            expired_removed,
+            groups_merged,
+            memories_compressed,
+            orphan_links_removed: orphan_links_removed as usize,
+            db_size_before: size_before,
+            db_size_after: size_after,
+        })
     }
 
     // ─── EXPORT ───────────────────────────────────────
@@ -530,18 +836,40 @@ impl Database {
     pub fn get_global_prompt(&self, project: Option<&str>, working_dir: Option<&str>) -> Option<String> {
         let mut prompts: Vec<String> = Vec::new();
 
+        // Helper to read file if modified since last cache, or use cache
+        fn get_cached_prompt(path: &std::path::Path) -> Option<String> {
+            if !path.exists() { return None; }
+            let metadata = std::fs::metadata(path).ok()?;
+            let modified = metadata.modified().ok()?;
+            
+            let mut cache = crate::PROMPT_CACHE.lock().unwrap();
+            let path_str = path.to_string_lossy().to_string();
+            
+            if let Some((last_mod, content)) = cache.get(&path_str) {
+                if last_mod == &modified {
+                    return Some(content.clone());
+                }
+            }
+            
+            if let Ok(content) = std::fs::read_to_string(path) {
+                cache.insert(path_str, (modified, content.clone()));
+                Some(content)
+            } else {
+                None
+            }
+        }
+
         // 1. Check configured path
-        if let Some(path) = self.get_config("global_prompt_path") {
-            if let Ok(content) = std::fs::read_to_string(&path) { prompts.push(content); }
+        if let Some(path_str) = self.get_config("global_prompt_path") {
+            let path = std::path::Path::new(&path_str);
+            if let Some(content) = get_cached_prompt(path) { prompts.push(content); }
         }
 
         // 2. Auto-scan ~/.MemoryPilot/GLOBAL_PROMPT.md
         let home_prompt = dirs::home_dir().map(|h| h.join(DB_DIR).join(PROMPT_FILE));
         if let Some(path) = &home_prompt {
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if !prompts.iter().any(|p| p == &content) { prompts.push(content); }
-                }
+            if let Some(content) = get_cached_prompt(path) {
+                if !prompts.iter().any(|p| p == &content) { prompts.push(content); }
             }
         }
 
@@ -551,18 +879,119 @@ impl Database {
             let mut stmt = self.conn.prepare("SELECT path FROM projects WHERE name=?1").ok()?;
             stmt.query_row(params![proj_name], |r| r.get::<_,String>(0)).ok()
         });
+        
         if let Some(dir) = proj_dir {
             let proj_prompt = std::path::Path::new(&dir).join(PROMPT_FILE);
-            if proj_prompt.exists() {
-                if let Ok(content) = std::fs::read_to_string(&proj_prompt) {
-                    if !prompts.iter().any(|p| p == &content) { prompts.push(content); }
-                }
+            if let Some(content) = get_cached_prompt(&proj_prompt) {
+                if !prompts.iter().any(|p| p == &content) { prompts.push(content); }
             }
         }
 
         if prompts.is_empty() { None } else { Some(prompts.join("\n\n---\n\n")) }
     }
     // ─── PROJECT CONTEXT ──────────────────────────────
+
+    pub fn backfill_embeddings(&self) -> Result<usize, String> {
+        let mut count = 0;
+        let mut stmt = self.conn.prepare("SELECT id, content FROM memories WHERE embedding IS NULL")
+            .map_err(|e| format!("Backfill prepare: {}", e))?;
+        
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).map_err(|e| format!("Backfill query: {}", e))?;
+        
+        let mut updates = Vec::new();
+        for r in rows.flatten() {
+            updates.push(r);
+        }
+        
+        for (id, content) in updates {
+            let emb = crate::embedding::embed_text(&content);
+            let blob = crate::embedding::vec_to_blob(&emb);
+            let _ = self.conn.execute(
+                "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+                params![blob, id]
+            );
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn get_project_brain(&self, project: &str, max_tokens: Option<usize>) -> Result<serde_json::Value, String> {
+        let max_t = max_tokens.unwrap_or(1500);
+        let max_chars = max_t * 4;
+        let mut current_chars = 0;
+        
+        let mut tech_stack = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT entity_value FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE m.project = ?1 AND e.entity_kind = 'tech' LIMIT 15") {
+            if let Ok(rows) = stmt.query_map(params![project], |r| r.get::<_, String>(0)) {
+                for tech in rows.flatten() {
+                    let len = tech.len();
+                    if current_chars + len > max_chars { break; }
+                    current_chars += len;
+                    tech_stack.push(tech);
+                }
+            }
+        }
+        
+        let (core_arch, _) = self.list_memories(Some(project), Some("architecture"), 10, 0)?;
+        let mut arch_content = Vec::new();
+        for m in core_arch {
+            if current_chars + m.content.len() > max_chars { break; }
+            current_chars += m.content.len();
+            arch_content.push(m.content);
+        }
+
+        let (decisions, _) = self.list_memories(Some(project), Some("decision"), 10, 0)?;
+        let mut dec_content = Vec::new();
+        for m in decisions {
+            if current_chars + m.content.len() > max_chars { break; }
+            current_chars += m.content.len();
+            dec_content.push(m.content);
+        }
+
+        let (bugs, _) = self.list_memories(Some(project), Some("bug"), 10, 0)?;
+        let mut bug_content = Vec::new();
+        for m in bugs {
+            if current_chars + m.content.len() > max_chars { break; }
+            current_chars += m.content.len();
+            bug_content.push(m.content);
+        }
+        
+        let mut recent_content = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT content FROM memories WHERE project = ?1 AND updated_at > datetime('now','-7 days') ORDER BY updated_at DESC LIMIT 10") {
+            if let Ok(rows) = stmt.query_map(params![project], |r| r.get::<_, String>(0)) {
+                for content in rows.flatten() {
+                    if current_chars + content.len() > max_chars { break; }
+                    current_chars += content.len();
+                    recent_content.push(content);
+                }
+            }
+        }
+        
+        let mut key_components = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT DISTINCT entity_value FROM memory_entities e JOIN memories m ON e.memory_id = m.id WHERE m.project = ?1 AND e.entity_kind IN ('component', 'file') LIMIT 15") {
+            if let Ok(rows) = stmt.query_map(params![project], |r| r.get::<_, String>(0)) {
+                for comp in rows.flatten() {
+                    let len = comp.len();
+                    if current_chars + len > max_chars { break; }
+                    current_chars += len;
+                    key_components.push(comp);
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "project": project,
+            "tech_stack": tech_stack,
+            "core_architecture": arch_content,
+            "current_critical_decisions": dec_content,
+            "active_bugs_known": bug_content,
+            "recent_changes": recent_content,
+            "key_components": key_components,
+            "approx_tokens_used": current_chars / 4
+        }))
+    }
 
     pub fn get_project_context(&self, project: Option<&str>, working_dir: Option<&str>) -> Result<serde_json::Value, String> {
         let proj_name = match project {
@@ -615,7 +1044,7 @@ impl Database {
         // 3. Critical memories (importance >= 4, any project)
         let critical: Vec<Memory> = {
             let mut stmt = self.conn.prepare(
-                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at \
+                "SELECT id,content,kind,project,tags,source,importance,expires_at,metadata,created_at,updated_at,last_accessed_at,access_count \
                  FROM memories WHERE importance >= 4 \
                  AND (expires_at IS NULL OR expires_at > datetime('now')) \
                  ORDER BY importance DESC, updated_at DESC LIMIT 30"
@@ -628,7 +1057,7 @@ impl Database {
         // 4. Hint-based search (if user/agent gives context about current task)
         let hint_results = if let Some(h) = hints {
             if !h.trim().is_empty() {
-                self.search(h, 10, proj_ref, None, None).unwrap_or_default()
+                self.search(h, 10, proj_ref, None, None, None).unwrap_or_default()
             } else { vec![] }
         } else { vec![] };
 
@@ -673,9 +1102,11 @@ impl Database {
             let id = Uuid::new_v4().to_string();
             let now = Utc::now().to_rfc3339();
             let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
+            let emb = crate::embedding::embed_text(content);
+            let emb_blob = crate::embedding::vec_to_blob(&emb);
             tx.execute(
-                "INSERT INTO memories (id,content,kind,project,tags,source,importance,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,3,?7,?8)",
-                params![id, content, kind, project.as_deref(), tags_json, source, now, now],
+                "INSERT INTO memories (id,content,kind,project,tags,source,importance,embedding,created_at,updated_at,access_count) VALUES (?1,?2,?3,?4,?5,?6,3,?7,?8,?9,0)",
+                params![id, content, kind, project.as_deref(), tags_json, source, emb_blob, now, now],
             ).map_err(|e| format!("Import: {}", e))?;
             let rowid = tx.last_insert_rowid();
             tx.execute(
@@ -763,6 +1194,8 @@ fn row_to_memory(row: &rusqlite::Row) -> Memory {
         metadata,
         created_at: row.get(9).unwrap_or_default(),
         updated_at: row.get(10).unwrap_or_default(),
+        last_accessed_at: row.get(11).unwrap_or(None),
+        access_count: row.get(12).unwrap_or(0),
     }
 }
 

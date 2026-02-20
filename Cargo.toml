@@ -1,9 +1,9 @@
 [package]
 name = "memory-pilot"
-version = "2.1.0"
+version = "3.1.0"
 edition = "2021"
 authors = ["SOFLUTION LTD"]
-description = "High-performance MCP memory server — SQLite FTS5, dedup, importance, TTL, bulk ops, export."
+description = "God-Tier MCP memory server — Hybrid search (BM25+TF-IDF RRF), Knowledge Graph, GC, Project Brain, File Watcher."
 license = "MIT"
 repository = "https://github.com/Soflution1/MemoryPilot"
 keywords = ["mcp", "memory", "sqlite", "cursor", "ai"]
@@ -20,6 +20,7 @@ rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
+notify = { version = "6", features = ["macos_kqueue"] }
 
 [profile.release]
 opt-level = 3

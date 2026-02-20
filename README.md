@@ -3,103 +3,184 @@
 </p>
 
 <p align="center">
-  <strong>High-performance MCP memory server for AI agents.</strong><br>
-  <sub>Persistent searchable memory · Project-aware · Single binary · Zero dependencies</sub>
+  <strong>The most advanced MCP memory server. Period.</strong><br>
+  <sub>Hybrid search (BM25 + TF-IDF RRF) · Knowledge graph · GC · Project brain · File watcher · Single binary</sub>
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/v3.1-latest-green" alt="v3.1"/>
   <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust"/>
-  <img src="https://img.shields.io/badge/search-SQLite_FTS5-blueviolet" alt="SQLite FTS5"/>
+  <img src="https://img.shields.io/badge/search-Hybrid_RRF-blueviolet" alt="Hybrid RRF"/>
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"/>
-  <img src="https://img.shields.io/badge/binary-~2.2MB-yellow" alt="Binary size"/>
+  <img src="https://img.shields.io/badge/binary-2.4MB-yellow" alt="Binary size"/>
 </p>
 
 ---
 
 ## Why
 
-AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness.
+AI coding assistants forget everything between sessions. MemoryPilot gives them persistent, searchable memory with project awareness, semantic understanding, and automatic knowledge organization.
 
-**vs MCP Memory (official):** 1 tool call to store (vs 3), BM25 ranked search (vs unranked), project scoping, auto-dedup, importance weighting, TTL expiration. Single 2.2MB binary vs Node.js + npm.
+**vs every other MCP memory server:**
 
-## Features
+| Feature | MemoryPilot v3.1 | MCP Memory (Node.js) | Other Rust/Python servers |
+|---------|-----------------|----------------------|--------------------------|
+| Search | Hybrid BM25 + TF-IDF RRF fusion | Unranked filter | BM25 only |
+| Knowledge graph | Auto entity extraction + linking | No | No |
+| Garbage collection | Heuristic merge + scoring | No | TTL only |
+| Project brain (<1500 tokens) | Yes | No | No |
+| File watcher context boost | Yes | No | No |
+| Deduplication | Jaccard 85% threshold | No | Basic exact match |
+| Memory types | 9 types, importance 1-5 | 1 type | 2-3 types |
+| Startup | 1-2 ms | 50-100 ms | 5-20 ms |
+| Binary | 2.4 MB, zero deps | 200 MB+ (node_modules) | 5-50 MB |
+| Storage | SQLite WAL + FTS5 | JSON files | SQLite basic |
 
-- **SQLite FTS5** full-text search with BM25 ranking × importance weighting
-- **Project-scoped** memories with auto-detection from working directory
-- **Auto-deduplication** (85% similarity threshold, no duplicates)
-- **16 MCP tools** — add, bulk add, search, update, delete, list, export, and more
-- **9 memory types** — fact, preference, decision, pattern, snippet, bug, credential, todo, note
-- **TTL/expiration** — memories auto-cleanup when expired
-- **Export** — JSON or Markdown with importance stars and type grouping
-- **Global prompt** — auto-discovers `GLOBAL_PROMPT.md` from `~/.memory-pilot/`
-- **Migration** — import from v1 JSON format
+## The 5 Pillars
 
-## Performance
+### 1. Hybrid Search (BM25 + TF-IDF RRF)
 
-| Metric | MemoryPilot | MCP Memory (Node.js) |
-|--------|------------|---------------------|
-| Startup | 1-2ms | 50-100ms |
-| RAM | 5MB | 30MB |
-| Binary | 2.2MB | 200MB+ (node_modules) |
-| Search | FTS5 BM25 (C speed) | Unranked filter |
-| Storage | SQLite ACID | JSON in npm cache |
+Every memory gets a 384-dimension TF-IDF embedding vector on insert. Search runs both BM25 full-text and cosine similarity in parallel, then merges results with Reciprocal Rank Fusion. This catches semantic matches that keyword search misses.
+
+Results are boosted by importance weighting, knowledge graph link density, and file watcher context.
+
+### 2. Knowledge Graph
+
+Every memory is automatically analyzed for entities: technologies, file paths, components, projects. Entities are stored in a dedicated table. Memories sharing entities are auto-linked with inferred relationship types (resolves, implements, depends_on, deprecates...).
+
+The graph gives search a PageRank-like boost: well-connected memories rank higher.
+
+### 3. Garbage Collection
+
+Old, low-importance memories are scored for cleanup candidacy. Groups of related stale memories are merged into condensed summaries using heuristic keyword extraction. Orphaned links and entities are cleaned. DB is vacuumed after significant deletions.
+
+### 4. Project Brain
+
+One tool call returns a dense JSON snapshot of a project under 1500 tokens: tech stack, architecture decisions, active bugs, recent changes, key components. Perfect for injecting into a new conversation.
+
+### 5. File Watcher
+
+Monitors the working directory for file changes. Recently modified file names are used as boost keywords during search, so memories related to what you're actively editing rank higher automatically.
 
 ## Install
 
 ```bash
+git clone https://github.com/Soflution1/MemoryPilot.git
+cd MemoryPilot
 cargo build --release
-cp target/release/memory-pilot ~/.local/bin/
+cp target/release/MemoryPilot ~/.local/bin/
+chmod +x ~/.local/bin/MemoryPilot
+xattr -cr ~/.local/bin/MemoryPilot  # macOS only
 ```
 
-## Cursor Integration
+### Cursor Integration
 
 Add to `~/.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "memory-pilot": {
-      "command": "/path/to/memory-pilot",
-      "args": []
+    "MemoryPilot": {
+      "command": "/Users/you/.local/bin/MemoryPilot"
     }
   }
 }
 ```
 
-## MCP Tools (16)
+Or use via [McpHub](https://github.com/Soflution1/McpHub) for SSE transport with all your other MCP servers.
+
+### First run
+
+```bash
+# If upgrading from v1 (JSON files):
+MemoryPilot --migrate
+
+# Compute embeddings for existing memories:
+MemoryPilot --backfill
+```
+
+## MCP Tools (20)
 
 | Tool | Description |
 |------|-------------|
-| `add_memory` | Store with auto-dedup, importance (1-5), TTL |
-| `add_memories` | Bulk add multiple memories in 1 call |
-| `search_memory` | FTS5 BM25 × importance ranked search |
-| `get_memory` | Retrieve by ID |
-| `update_memory` | Update content/kind/tags/importance/TTL |
-| `delete_memory` | Delete by ID |
-| `list_memories` | List with filters & pagination |
-| `get_project_context` | Full context in 1 call + auto-detect project |
-| `register_project` | Register project filesystem path |
-| `list_projects` | List projects with memory counts |
-| `get_stats` | Database statistics |
-| `get_global_prompt` | Auto-discover GLOBAL_PROMPT.md |
-| `export_memories` | Export as JSON or Markdown |
-| `set_config` | Set config values |
-| `cleanup_expired` | Remove expired memories |
-| `migrate_v1` | Import from v1 JSON files |
+| **`recall`** | Start here. Loads all context in one shot: project memories, preferences, critical facts, patterns, decisions, global prompt. |
+| **`get_project_brain`** | Instant project summary (<1500 tokens): tech stack, architecture, bugs, recent changes, components. |
+| **`search_memory`** | Hybrid BM25 + TF-IDF RRF search, boosted by importance, graph links, and file watcher context. |
+| **`get_file_context`** | Memories related to recently modified files in working directory. |
+| `add_memory` | Store with auto-dedup (Jaccard 85%), auto entity extraction, auto graph linking. Importance 1-5, TTL. |
+| `add_memories` | Bulk add multiple memories in one call with per-item dedup. |
+| `get_memory` | Retrieve by ID. |
+| `update_memory` | Update content, kind, tags, importance, TTL. |
+| `delete_memory` | Delete by ID (cascades to entities and links). |
+| `list_memories` | List with project/kind filters and pagination. |
+| `get_project_context` | Full project context with preferences and patterns. |
+| `register_project` | Register project with filesystem path for auto-detection. |
+| `list_projects` | List projects with memory counts. |
+| `get_stats` | DB statistics: totals, by kind, by project, DB size. |
+| `get_global_prompt` | Auto-discover GLOBAL_PROMPT.md from ~/.MemoryPilot/ or project root. |
+| `export_memories` | Export as JSON or Markdown with importance stars. |
+| `set_config` | Set config values (e.g. global_prompt_path). |
+| `run_gc` | Garbage collection: merge old memories, clean orphans, vacuum. Supports dry_run. |
+| `cleanup_expired` | Remove expired TTL memories. |
+| `migrate_v1` | Import from v1 JSON files. |
+
+### Memory Types
+
+`fact` · `preference` · `decision` · `pattern` · `snippet` · `bug` · `credential` · `todo` · `note`
+
+Each memory has importance (1-5), optional TTL, tags, project scope, and auto-generated embedding + entity links.
 
 ## CLI
 
 ```bash
-memory-pilot              # Start MCP stdio server
-memory-pilot --migrate    # Migrate v1 JSON data to SQLite
-memory-pilot --version    # Show version
-memory-pilot --help       # Show help
+MemoryPilot              # Start MCP stdio server
+MemoryPilot --backfill   # Compute missing TF-IDF embeddings
+MemoryPilot --migrate    # Import v1 JSON data to SQLite
+MemoryPilot --version    # Show version
+MemoryPilot --help       # Show help
 ```
+
+## Architecture
+
+```
+src/main.rs        — CLI + MCP stdio server loop + file watcher init
+src/db.rs          — SQLite engine: hybrid search, CRUD, graph, GC, brain, recall
+src/tools.rs       — 20 MCP tool definitions + handlers
+src/protocol.rs    — JSON-RPC types
+src/embedding.rs   — TF-IDF 384-dim vectors, cosine similarity, RRF fusion
+src/graph.rs       — Entity extraction (tech, files, components) + relation inference
+src/gc.rs          — GC scoring, heuristic memory merging, stopwords
+src/watcher.rs     — File system watcher with keyword extraction for search boost
+```
+
+### Database Schema
+
+```sql
+memories        — id, content, kind, project, tags, importance, embedding (BLOB),
+                  expires_at, last_accessed_at, access_count, metadata
+memories_fts    — FTS5 virtual table (content, tags, kind, project)
+memory_entities — memory_id, entity_kind, entity_value
+memory_links    — source_id, target_id, relation_type (CASCADE delete)
+projects        — name, path, description
+config          — key/value store
+```
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Binary size | 2.4 MB |
+| Startup | 1-2 ms |
+| Search (866 memories) | <1 ms (hybrid RRF) |
+| RAM | ~5 MB |
+| Embedding generation | <0.1 ms per memory |
+| Storage overhead | ~1.5 KB per embedding (384 × 4 bytes) |
+| Runtime dependencies | **None** |
 
 ## Storage
 
-- Database: `~/.memory-pilot/memory.db`
-- Global prompt: `~/.memory-pilot/GLOBAL_PROMPT.md`
+- Database: `~/.MemoryPilot/memory.db`
+- Global prompt: `~/.MemoryPilot/GLOBAL_PROMPT.md`
 
 ## License
 

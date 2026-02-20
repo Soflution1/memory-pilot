@@ -126,6 +126,18 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "get_project_brain",
+            "description": "INSTANT PROJECT BRAIN — Dense JSON summary (<1500 tokens): tech stack, architecture, active bugs, recent changes, preferences, key components. Use at start of focused work.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": ["string","null"], "description": "Project name (or null for auto-detect)" },
+                    "working_dir": { "type": ["string","null"], "description": "Auto-detect project from path" },
+                    "max_tokens": { "type": "integer", "description": "Dynamic budget. Default is 1500" }
+                }
+            }
+        },
+        {
             "name": "register_project",
             "description": "Register project with filesystem path for auto-detection.",
             "inputSchema": {
@@ -164,7 +176,30 @@ pub fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": { "key": { "type": "string" }, "value": { "type": "string" } }, "required": ["key", "value"] }
         },
         { "name": "migrate_v1", "description": "Import from v1 JSON files. Skips duplicates.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "cleanup_expired", "description": "Manually remove all expired memories.", "inputSchema": { "type": "object", "properties": {} } }
+        { "name": "cleanup_expired", "description": "Manually remove all expired memories.", "inputSchema": { "type": "object", "properties": {} } },
+        { 
+            "name": "run_gc", 
+            "description": "Trigger Garbage Collection manually. Compresses old bugs/snippets and deletes expired.", 
+            "inputSchema": { 
+                "type": "object", 
+                "properties": {
+                    "age_days": { "type": "integer", "default": 30 },
+                    "importance_threshold": { "type": "integer", "default": 3 },
+                    "dry_run": { "type": "boolean", "default": false }
+                } 
+            } 
+        },
+        {
+            "name": "get_file_context",
+            "description": "Get memories related to recently modified files in the working directory. Uses the file watcher to know what you're working on.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "working_dir": { "type": "string" }
+                },
+                "required": ["working_dir"]
+            }
+        }
     ]})
 }
 /// Handle a tools/call request.
@@ -179,6 +214,7 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "delete_memory" => handle_delete(db, args),
         "list_memories" => handle_list(db, args),
         "get_project_context" => handle_project_context(db, args),
+        "get_project_brain" => handle_get_project_brain(db, args),
         "register_project" => handle_register_project(db, args),
         "list_projects" => handle_list_projects(db),
         "get_stats" => handle_stats(db),
@@ -187,6 +223,8 @@ pub fn handle_tool_call(db: &Database, name: &str, args: &Value) -> Value {
         "set_config" => handle_set_config(db, args),
         "migrate_v1" => handle_migrate(db),
         "cleanup_expired" => handle_cleanup(db),
+        "run_gc" => handle_run_gc(db, args),
+        "get_file_context" => handle_get_file_context(db, args),
         _ => tool_error(&format!("Unknown tool: {}", name)),
     }
 }
@@ -249,7 +287,17 @@ fn handle_search(db: &Database, args: &Value) -> Value {
     let kind = args.get("kind").and_then(|v| v.as_str());
     let tags: Option<Vec<String>> = args.get("tags").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-    match db.search(query, limit, project, kind, tags.as_deref()) {
+        
+    let mut watcher_keywords = Vec::new();
+    if let Some(watcher) = crate::WATCHER_STATE.get() {
+        if let Ok(state) = watcher.lock() {
+            watcher_keywords = state.get_boost_keywords();
+        }
+    }
+    
+    let wk_ref = if watcher_keywords.is_empty() { None } else { Some(watcher_keywords.as_slice()) };
+    
+    match db.search(query, limit, project, kind, tags.as_deref(), wk_ref) {
         Ok(results) => {
             let output = json!({ "query": query, "count": results.len(),
                 "results": results.iter().map(|r| json!({
@@ -316,6 +364,22 @@ fn handle_project_context(db: &Database, args: &Value) -> Value {
     }
 }
 
+fn handle_get_project_brain(db: &Database, args: &Value) -> Value {
+    let proj_detect = args.get("working_dir").and_then(|v| v.as_str()).and_then(|wd| db.detect_project(wd).ok().flatten());
+    
+    let project = match args.get("project").and_then(|v| v.as_str()).or_else(|| proj_detect.as_deref()) {
+        Some(p) => p,
+        None => return tool_error("project or working_dir is required, and project must be found"),
+    };
+    
+    let max_tokens = args.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as usize);
+    
+    match db.get_project_brain(project, max_tokens) {
+        Ok(brain) => tool_result(&serde_json::to_string_pretty(&brain).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
 fn handle_register_project(db: &Database, args: &Value) -> Value {
     let name = match args.get("name").and_then(|v| v.as_str()) { Some(n) => n, _ => return tool_error("name required") };
     let path = match args.get("path").and_then(|v| v.as_str()) { Some(p) => p, _ => return tool_error("path required") };
@@ -377,6 +441,52 @@ fn handle_migrate(db: &Database) -> Value {
 fn handle_cleanup(db: &Database) -> Value {
     match db.cleanup_expired() {
         Ok(count) => tool_result(&format!("Cleaned up {} expired memories.", count)),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_run_gc(db: &Database, args: &Value) -> Value {
+    let mut config = crate::gc::GcConfig::default();
+    if let Some(age) = args.get("age_days").and_then(|v| v.as_i64()) { config.age_days = age; }
+    if let Some(imp) = args.get("importance_threshold").and_then(|v| v.as_i64()) { config.importance_threshold = imp as i32; }
+    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    
+    match db.run_gc(&config, dry_run) {
+        Ok(report) => tool_result(&serde_json::to_string_pretty(&report).unwrap()),
+        Err(e) => tool_error(&e),
+    }
+}
+
+fn handle_get_file_context(db: &Database, args: &Value) -> Value {
+    let _wd = match args.get("working_dir").and_then(|v| v.as_str()) {
+        Some(w) => w,
+        None => return tool_error("working_dir required"),
+    };
+    
+    let mut keywords = Vec::new();
+    if let Some(watcher) = crate::WATCHER_STATE.get() {
+        if let Ok(state) = watcher.lock() {
+            keywords = state.get_boost_keywords();
+        }
+    }
+    
+    if keywords.is_empty() {
+        return tool_result("No recent file changes detected by watcher.");
+    }
+    
+    let query = keywords.join(" ");
+    match db.search(&query, 10, None, None, None, Some(&keywords)) {
+        Ok(results) => {
+            let output = json!({ 
+                "recent_file_keywords": keywords, 
+                "count": results.len(),
+                "results": results.iter().map(|r| json!({
+                    "id": r.memory.id, "content": r.memory.content, "kind": r.memory.kind,
+                    "project": r.memory.project, "tags": r.memory.tags, "score": r.score, "importance": r.memory.importance,
+                })).collect::<Vec<_>>()
+            });
+            tool_result(&serde_json::to_string_pretty(&output).unwrap())
+        }
         Err(e) => tool_error(&e),
     }
 }
